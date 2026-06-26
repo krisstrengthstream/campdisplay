@@ -1,0 +1,703 @@
+// ============================================================
+//  Camp Control — Display Board Firmware  (LVGL v9 / ESP32 core 3.x)
+//  Target: Waveshare ESP32-S3-Touch-LCD-4.3 (800×480, GT911 touch)
+//
+//  Multi-screen UI:
+//    STANDBY  — clock + battery % gauge (tap anywhere → BUTTONS)
+//    BUTTONS  — 6 relay toggle buttons   (swipe L/R between pages)
+//    MONITOR  — telemetry cards + 30-min history graph
+//    LEVELING — bubble level + start-level button
+//
+//  Swipe left/right cycles BUTTONS → MONITOR → LEVELING.
+//  Idle 30s with no touch returns to STANDBY.
+//
+//  Board config: esp_panel_board_supported_conf.h must be in this folder
+//  with the 4.3" board enabled (already done — that's why it boots).
+// ============================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <time.h>
+#include <lvgl.h>
+#include <ESP_Panel_Library.h>
+#include "camp_data.h"
+static int dbgX = -1, dbgY = -1;
+
+// ── Draw buffer ────────────────────────────────────────────────────────────
+#define LVGL_BUF_BYTES  (800 * 40 * 2)   // 40 lines, RGB565
+static uint8_t *lvgl_buf = nullptr;
+
+// ── LVGL mutex ─────────────────────────────────────────────────────────────
+static SemaphoreHandle_t lvgl_mux = nullptr;
+#define LVGL_LOCK()   xSemaphoreTakeRecursive(lvgl_mux, portMAX_DELAY)
+#define LVGL_UNLOCK() xSemaphoreGiveRecursive(lvgl_mux)
+
+static ESP_Panel *panel = nullptr;
+
+// ── Relay labels ───────────────────────────────────────────────────────────
+static const char *RELAY_LABELS[6] = {
+  "Rear Lights", "Water Pump", "Hot Water", "Spare 1", "Spare 2", "Spare 3"
+};
+
+// ── Theme palette (dark blue + frosted glass) ──────────────────────────────
+#define COL_BG        0x0a0e1a   // near-black navy
+#define COL_BG2       0x0d1424   // slightly lighter base
+#define COL_GLASS     0x16203a   // frosted card fill
+#define COL_GLASS_HI  0x1e2c4d   // card highlight / pressed
+#define COL_BORDER    0x2a3a5e   // subtle card edge
+#define COL_ACCENT    0x4d9fff   // primary blue
+#define COL_ACCENT_DK 0x2563eb   // deep blue
+#define COL_CYAN      0x5ce1e6   // cyan highlight
+#define COL_TXT       0xeaf2ff   // near-white text
+#define COL_TXT_DIM   0x6b7a99   // muted text
+#define COL_ON        0x3ddc97   // relay ON green
+#define COL_WARN      0xffb454   // amber
+#define COL_DANGER    0xff5c7a   // red
+
+// ── Shared state from ESP-NOW ──────────────────────────────────────────────
+static volatile CampData campData = {};
+static volatile bool dataUpdated  = false;
+static uint32_t lastEspNowMs      = 0;
+
+// ── Screen management ──────────────────────────────────────────────────────
+enum Screen { SCR_STANDBY, SCR_BUTTONS, SCR_MONITOR, SCR_LEVELING };
+static Screen curScreen = SCR_STANDBY;
+static lv_obj_t *scrStandby, *scrButtons, *scrMonitor, *scrLeveling;
+static uint32_t lastTouchMs = 0;
+#define IDLE_TIMEOUT_MS 60000
+
+// ── History ring buffers (30 min @ 1 sample/2s = 900 samples) ─────────────
+#define HIST_LEN 900
+struct History { float v[HIST_LEN]; int head; int count; };
+static History histVoltage, histCurrent, histSolar, histTemp;
+static uint32_t lastHistMs = 0;
+static int monitorMetric = 0;   // 0=V 1=A 2=Solar 3=Temp
+
+static void histPush(History &h, float val) {
+  h.v[h.head] = val;
+  h.head = (h.head + 1) % HIST_LEN;
+  if (h.count < HIST_LEN) h.count++;
+}
+
+// ── Widget handles needing live updates ────────────────────────────────────
+static lv_obj_t *lblClock, *lblDate, *battArc, *lblBattPct, *lblStandbyV;
+static lv_obj_t *relayBtns[6], *relayBtnLbls[6], *relayBtnStates[6];
+static lv_obj_t *monCards[4], *monCardVals[4], *monChart, *lblMonTitle;
+static lv_chart_series_t *monSeries;
+static lv_obj_t *levelBubble, *lblLevelStatus, *lblPitch, *lblRoll;
+static lv_obj_t *pageDots[3];
+
+// mock battery % (until shunt)
+static int mockBattPct = 87;
+
+// ════════════════════════════════════════════════════════════════════════
+//  LVGL driver callbacks
+// ════════════════════════════════════════════════════════════════════════
+static void lvglFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+  ESP_Panel *p = (ESP_Panel *)lv_display_get_user_data(disp);
+  p->getLcd()->drawBitmap(area->x1, area->y1,
+                          area->x2 - area->x1 + 1, area->y2 - area->y1 + 1, px_map);
+  lv_display_flush_ready(disp);
+}
+static void lvglTouchCb(lv_indev_t *indev, lv_indev_data_t *data) {
+  ESP_Panel *p = (ESP_Panel *)lv_indev_get_user_data(indev);
+  if (!p->getTouch()) { data->state = LV_INDEV_STATE_RELEASED; return; }
+  ESP_PanelTouchPoint pts[1];
+  int n = p->getTouch()->readPoints(pts, 1);
+  if (n > 0) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = pts[0].x;
+    data->point.y = pts[0].y;
+    lastTouchMs = millis();
+    dbgX = pts[0].x; dbgY = pts[0].y;
+  } else {
+    data->state = LV_INDEV_STATE_RELEASED;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  ESP-NOW
+// ════════════════════════════════════════════════════════════════════════
+static void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(CampData)) return;
+  memcpy((void *)&campData, data, sizeof(CampData));
+  dataUpdated  = true;
+  lastEspNowMs = millis();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Reusable styling helpers
+// ════════════════════════════════════════════════════════════════════════
+static void styleGlassCard(lv_obj_t *o) {
+  lv_obj_set_style_bg_color(o, lv_color_hex(COL_GLASS), 0);
+  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+  // frosted-glass feel: subtle vertical gradient + light border + soft shadow
+  lv_obj_set_style_bg_grad_color(o, lv_color_hex(COL_GLASS_HI), 0);
+  lv_obj_set_style_bg_grad_dir(o, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_border_color(o, lv_color_hex(COL_BORDER), 0);
+  lv_obj_set_style_border_width(o, 1, 0);
+  lv_obj_set_style_border_opa(o, LV_OPA_60, 0);
+  lv_obj_set_style_radius(o, 18, 0);
+  lv_obj_set_style_shadow_color(o, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_shadow_width(o, 24, 0);
+  lv_obj_set_style_shadow_opa(o, LV_OPA_40, 0);
+  lv_obj_set_style_shadow_ofs_y(o, 6, 0);
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void styleScreenBg(lv_obj_t *scr) {
+  lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), 0);
+  lv_obj_set_style_bg_grad_color(scr, lv_color_hex(COL_BG2), 0);
+  lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+}
+
+// forward declaration (onGesture uses it)
+void showScreen(Screen s);
+
+// swipe gesture handler — attached to each swipeable screen
+static void onGesture(lv_event_t *e) {
+  lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+  if (dir == LV_DIR_LEFT) {
+    if (curScreen == SCR_BUTTONS)  showScreen(SCR_MONITOR);
+    else if (curScreen == SCR_MONITOR)  showScreen(SCR_LEVELING);
+  } else if (dir == LV_DIR_RIGHT) {
+    if (curScreen == SCR_LEVELING) showScreen(SCR_MONITOR);
+    else if (curScreen == SCR_MONITOR)  showScreen(SCR_BUTTONS);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Page-dot indicator (shared across the 3 main pages)
+// ════════════════════════════════════════════════════════════════════════
+static void buildPageDots(lv_obj_t *parent, int activeIdx) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, 80, 12);
+  lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -10);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_gap(row, 8, 0);
+  for (int i = 0; i < 3; i++) {
+    lv_obj_t *d = lv_obj_create(row);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_size(d, i == activeIdx ? 18 : 7, 7);
+    lv_obj_set_style_radius(d, 4, 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(d,
+      lv_color_hex(i == activeIdx ? COL_ACCENT : COL_TXT_DIM), 0);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCREEN 1 — STANDBY (clock + battery gauge)
+// ════════════════════════════════════════════════════════════════════════
+static void wakeFromStandby(lv_event_t *e) { showScreen(SCR_BUTTONS); }
+
+static void buildStandby() {
+  scrStandby = lv_obj_create(NULL);
+  styleScreenBg(scrStandby);
+  lv_obj_add_event_cb(scrStandby, wakeFromStandby, LV_EVENT_CLICKED, NULL);
+
+  // Clock
+  lblClock = lv_label_create(scrStandby);
+  lv_label_set_text(lblClock, "--:--");
+  lv_obj_set_style_text_color(lblClock, lv_color_hex(COL_TXT), 0);
+  lv_obj_set_style_text_font(lblClock, &lv_font_montserrat_48, 0);
+  lv_obj_align(lblClock, LV_ALIGN_LEFT_MID, 70, -30);
+
+  lblDate = lv_label_create(scrStandby);
+  lv_label_set_text(lblDate, "Camp Control");
+  lv_obj_set_style_text_color(lblDate, lv_color_hex(COL_TXT_DIM), 0);
+  lv_obj_set_style_text_font(lblDate, &lv_font_montserrat_20, 0);
+  lv_obj_align_to(lblDate, lblClock, LV_ALIGN_OUT_BOTTOM_LEFT, 4, 12);
+
+  lv_obj_t *hint = lv_label_create(scrStandby);
+  lv_label_set_text(hint, "tap to begin");
+  lv_obj_set_style_text_color(hint, lv_color_hex(COL_TXT_DIM), 0);
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 74, -30);
+
+  // Battery arc gauge (right side)
+  battArc = lv_arc_create(scrStandby);
+  lv_obj_set_size(battArc, 260, 260);
+  lv_obj_align(battArc, LV_ALIGN_RIGHT_MID, -80, 0);
+  lv_arc_set_rotation(battArc, 135);
+  lv_arc_set_bg_angles(battArc, 0, 270);
+  lv_arc_set_range(battArc, 0, 100);
+  lv_arc_set_value(battArc, mockBattPct);
+  lv_obj_remove_flag(battArc, LV_OBJ_FLAG_CLICKABLE);
+  // track
+  lv_obj_set_style_arc_color(battArc, lv_color_hex(COL_GLASS_HI), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(battArc, 18, LV_PART_MAIN);
+  // indicator
+  lv_obj_set_style_arc_color(battArc, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(battArc, 18, LV_PART_INDICATOR);
+  // hide the knob
+  lv_obj_set_style_bg_opa(battArc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(battArc, 0, LV_PART_KNOB);
+
+  lblBattPct = lv_label_create(scrStandby);
+  lv_label_set_text(lblBattPct, "87%");
+  lv_obj_set_style_text_color(lblBattPct, lv_color_hex(COL_TXT), 0);
+  lv_obj_set_style_text_font(lblBattPct, &lv_font_montserrat_48, 0);
+  lv_obj_align_to(lblBattPct, battArc, LV_ALIGN_CENTER, 0, -12);
+
+  lblStandbyV = lv_label_create(scrStandby);
+  lv_label_set_text(lblStandbyV, "Battery");
+  lv_obj_set_style_text_color(lblStandbyV, lv_color_hex(COL_TXT_DIM), 0);
+  lv_obj_set_style_text_font(lblStandbyV, &lv_font_montserrat_16, 0);
+  lv_obj_align_to(lblStandbyV, battArc, LV_ALIGN_CENTER, 0, 30);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCREEN 2 — BUTTONS (6 relay toggles)
+// ════════════════════════════════════════════════════════════════════════
+static void onRelayBtn(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  bool now = !((campData.relayState >> idx) & 1);
+  // optimistic local toggle; relay board will confirm via next packet
+  if (now) campData.relayState |=  (1 << idx);
+  else     campData.relayState &= ~(1 << idx);
+  dataUpdated = true;
+  // NOTE: to actually switch the relay, the display would send an ESP-NOW
+  // command back to the relay board — wired up in a later step.
+}
+
+static void buildButtons() {
+  scrButtons = lv_obj_create(NULL);
+  styleScreenBg(scrButtons);
+  lv_obj_add_event_cb(scrButtons, onGesture, LV_EVENT_GESTURE, NULL);
+
+  lv_obj_t *title = lv_label_create(scrButtons);
+  lv_label_set_text(title, "Controls");
+  lv_obj_set_style_text_color(title, lv_color_hex(COL_TXT), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 28, 18);
+
+  const int CW = 232, CH = 116, GX = 28, GY = 64, GAP = 16;
+  for (int i = 0; i < 6; i++) {
+    int col = i % 3, row = i / 3;
+    lv_obj_t *b = lv_obj_create(scrButtons);
+    lv_obj_set_size(b, CW, CH);
+    lv_obj_set_pos(b, GX + col * (CW + GAP), GY + row * (CH + GAP));
+    styleGlassCard(b);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(b, lv_color_hex(COL_GLASS_HI), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(b, onRelayBtn, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    relayBtns[i] = b;
+
+    lv_obj_t *ico = lv_label_create(b);
+    lv_label_set_text(ico, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_font(ico, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(ico, lv_color_hex(COL_TXT_DIM), 0);
+    lv_obj_align(ico, LV_ALIGN_TOP_LEFT, 16, 14);
+
+    lv_obj_t *state = lv_label_create(b);
+    lv_label_set_text(state, "OFF");
+    lv_obj_set_style_text_font(state, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(state, lv_color_hex(COL_TXT_DIM), 0);
+    lv_obj_align(state, LV_ALIGN_TOP_RIGHT, -16, 18);
+    relayBtnStates[i] = state;
+
+    lv_obj_t *name = lv_label_create(b);
+    lv_label_set_text(name, RELAY_LABELS[i]);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(COL_TXT), 0);
+    lv_obj_align(name, LV_ALIGN_BOTTOM_LEFT, 16, -16);
+    relayBtnLbls[i] = name;
+  }
+  buildPageDots(scrButtons, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCREEN 3 — MONITOR (telemetry cards + history graph)
+// ════════════════════════════════════════════════════════════════════════
+static const char *MON_NAMES[4] = {"Battery", "Current", "Solar", "Temp"};
+static const char *MON_UNITS[4] = {"V", "A", "A", "C"};
+
+static void onMonCard(lv_event_t *e) {
+  monitorMetric = (int)(intptr_t)lv_event_get_user_data(e);
+  // highlight selected card
+  for (int i = 0; i < 4; i++) {
+    lv_obj_set_style_border_color(monCards[i],
+      lv_color_hex(i == monitorMetric ? COL_ACCENT : COL_BORDER), 0);
+    lv_obj_set_style_border_width(monCards[i], i == monitorMetric ? 2 : 1, 0);
+  }
+  lv_label_set_text_fmt(lblMonTitle, "%s — last 30 min", MON_NAMES[monitorMetric]);
+}
+
+static void buildMonitor() {
+  scrMonitor = lv_obj_create(NULL);
+  styleScreenBg(scrMonitor);
+  lv_obj_add_event_cb(scrMonitor, onGesture, LV_EVENT_GESTURE, NULL);
+
+  lv_obj_t *title = lv_label_create(scrMonitor);
+  lv_label_set_text(title, "Monitor");
+  lv_obj_set_style_text_color(title, lv_color_hex(COL_TXT), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 28, 16);
+
+  // 4 metric cards across the top
+  const int CW = 176, CH = 92, GX = 24, GY = 56, GAP = 12;
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t *c = lv_obj_create(scrMonitor);
+    lv_obj_set_size(c, CW, CH);
+    lv_obj_set_pos(c, GX + i * (CW + GAP), GY);
+    styleGlassCard(c);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(c, onMonCard, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    monCards[i] = c;
+
+    lv_obj_t *lbl = lv_label_create(c);
+    lv_label_set_text(lbl, MON_NAMES[i]);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_TXT_DIM), 0);
+    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 14, 12);
+
+    lv_obj_t *val = lv_label_create(c);
+    lv_label_set_text(val, "--");
+    lv_obj_set_style_text_font(val, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(val, lv_color_hex(COL_TXT), 0);
+    lv_obj_align(val, LV_ALIGN_BOTTOM_LEFT, 14, -12);
+    monCardVals[i] = val;
+  }
+
+  // History chart card
+  lv_obj_t *chartCard = lv_obj_create(scrMonitor);
+  lv_obj_set_size(chartCard, 752, 240);
+  lv_obj_align(chartCard, LV_ALIGN_TOP_MID, 0, 160);
+  styleGlassCard(chartCard);
+
+  lblMonTitle = lv_label_create(chartCard);
+  lv_label_set_text(lblMonTitle, "Battery — last 30 min");
+  lv_obj_set_style_text_font(lblMonTitle, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lblMonTitle, lv_color_hex(COL_TXT), 0);
+  lv_obj_align(lblMonTitle, LV_ALIGN_TOP_LEFT, 16, 12);
+
+  monChart = lv_chart_create(chartCard);
+  lv_obj_set_size(monChart, 712, 168);
+  lv_obj_align(monChart, LV_ALIGN_BOTTOM_MID, 0, -12);
+  lv_chart_set_type(monChart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(monChart, 120);   // downsampled view of history
+  lv_chart_set_update_mode(monChart, LV_CHART_UPDATE_MODE_SHIFT);
+  lv_obj_set_style_bg_opa(monChart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(monChart, 0, 0);
+  lv_obj_set_style_line_width(monChart, 3, LV_PART_ITEMS);
+  lv_obj_set_style_size(monChart, 0, 0, LV_PART_INDICATOR); // no point dots
+  lv_chart_set_div_line_count(monChart, 4, 0);
+  lv_obj_set_style_line_color(monChart, lv_color_hex(COL_BORDER), LV_PART_MAIN);
+  monSeries = lv_chart_add_series(monChart, lv_color_hex(COL_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+
+  buildPageDots(scrMonitor, 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SCREEN 4 — LEVELING (bubble + start button)
+// ════════════════════════════════════════════════════════════════════════
+static bool levelingActive = false;
+static void onStartLevel(lv_event_t *e) {
+  levelingActive = !levelingActive;
+  lv_obj_t *btn = (lv_obj_t*)lv_event_get_target(e);
+  lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+  if (levelingActive) {
+    lv_label_set_text(lbl, LV_SYMBOL_STOP "  Stop");
+    lv_obj_set_style_bg_color(btn, lv_color_hex(COL_DANGER), 0);
+    lv_label_set_text(lblLevelStatus, "Leveling…");
+  } else {
+    lv_label_set_text(lbl, LV_SYMBOL_PLAY "  Start Level");
+    lv_obj_set_style_bg_color(btn, lv_color_hex(COL_ACCENT_DK), 0);
+    lv_label_set_text(lblLevelStatus, "Manual");
+  }
+  // NOTE: visual only for now — real auto-level logic comes later.
+}
+
+static void buildLeveling() {
+  scrLeveling = lv_obj_create(NULL);
+  styleScreenBg(scrLeveling);
+  lv_obj_add_event_cb(scrLeveling, onGesture, LV_EVENT_GESTURE, NULL);
+
+  lv_obj_t *title = lv_label_create(scrLeveling);
+  lv_label_set_text(title, "Leveling");
+  lv_obj_set_style_text_color(title, lv_color_hex(COL_TXT), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 28, 16);
+
+  // Bubble level card (left)
+  lv_obj_t *card = lv_obj_create(scrLeveling);
+  lv_obj_set_size(card, 360, 360);
+  lv_obj_align(card, LV_ALIGN_LEFT_MID, 28, 10);
+  styleGlassCard(card);
+
+  int circW = 300;
+  lv_obj_t *circle = lv_obj_create(card);
+  lv_obj_set_size(circle, circW, circW);
+  lv_obj_center(circle);
+  lv_obj_set_style_bg_color(circle, lv_color_hex(COL_BG), 0);
+  lv_obj_set_style_border_color(circle, lv_color_hex(COL_BORDER), 0);
+  lv_obj_set_style_border_width(circle, 2, 0);
+  lv_obj_set_style_radius(circle, circW/2, 0);
+  lv_obj_clear_flag(circle, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *h = lv_obj_create(circle);
+  lv_obj_set_size(h, circW-30, 1); lv_obj_center(h);
+  lv_obj_set_style_bg_color(h, lv_color_hex(COL_BORDER), 0);
+  lv_obj_set_style_border_width(h, 0, 0);
+  lv_obj_t *v = lv_obj_create(circle);
+  lv_obj_set_size(v, 1, circW-30); lv_obj_center(v);
+  lv_obj_set_style_bg_color(v, lv_color_hex(COL_BORDER), 0);
+  lv_obj_set_style_border_width(v, 0, 0);
+
+  int ringW = circW/3;
+  lv_obj_t *ring = lv_obj_create(circle);
+  lv_obj_set_size(ring, ringW, ringW); lv_obj_center(ring);
+  lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(ring, lv_color_hex(COL_ACCENT), 0);
+  lv_obj_set_style_border_width(ring, 1, 0);
+  lv_obj_set_style_border_opa(ring, LV_OPA_50, 0);
+  lv_obj_set_style_radius(ring, ringW/2, 0);
+
+  int bubW = circW/7;
+  levelBubble = lv_obj_create(circle);
+  lv_obj_set_size(levelBubble, bubW, bubW);
+  lv_obj_center(levelBubble);
+  lv_obj_set_style_bg_color(levelBubble, lv_color_hex(COL_ON), 0);
+  lv_obj_set_style_border_width(levelBubble, 0, 0);
+  lv_obj_set_style_radius(levelBubble, bubW/2, 0);
+  lv_obj_set_style_shadow_color(levelBubble, lv_color_hex(COL_ON), 0);
+  lv_obj_set_style_shadow_width(levelBubble, 20, 0);
+  lv_obj_set_style_shadow_opa(levelBubble, LV_OPA_60, 0);
+
+  // Right side: readouts + start button
+  lv_obj_t *info = lv_obj_create(scrLeveling);
+  lv_obj_set_size(info, 360, 360);
+  lv_obj_align(info, LV_ALIGN_RIGHT_MID, -28, 10);
+  styleGlassCard(info);
+
+  lblLevelStatus = lv_label_create(info);
+  lv_label_set_text(lblLevelStatus, "Manual");
+  lv_obj_set_style_text_font(lblLevelStatus, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(lblLevelStatus, lv_color_hex(COL_CYAN), 0);
+  lv_obj_align(lblLevelStatus, LV_ALIGN_TOP_MID, 0, 28);
+
+  lblPitch = lv_label_create(info);
+  lv_label_set_text(lblPitch, "Pitch   0.0°");
+  lv_obj_set_style_text_font(lblPitch, &lv_font_montserrat_26, 0);
+  lv_obj_set_style_text_color(lblPitch, lv_color_hex(COL_TXT), 0);
+  lv_obj_align(lblPitch, LV_ALIGN_TOP_MID, 0, 90);
+
+  lblRoll = lv_label_create(info);
+  lv_label_set_text(lblRoll, "Roll    0.0°");
+  lv_obj_set_style_text_font(lblRoll, &lv_font_montserrat_26, 0);
+  lv_obj_set_style_text_color(lblRoll, lv_color_hex(COL_TXT), 0);
+  lv_obj_align(lblRoll, LV_ALIGN_TOP_MID, 0, 140);
+
+  lv_obj_t *btn = lv_btn_create(info);
+  lv_obj_set_size(btn, 280, 64);
+  lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -28);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(COL_ACCENT_DK), 0);
+  lv_obj_set_style_radius(btn, 14, 0);
+  lv_obj_set_style_shadow_color(btn, lv_color_hex(COL_ACCENT), 0);
+  lv_obj_set_style_shadow_width(btn, 20, 0);
+  lv_obj_set_style_shadow_opa(btn, LV_OPA_40, 0);
+  lv_obj_add_event_cb(btn, onStartLevel, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *bl = lv_label_create(btn);
+  lv_label_set_text(bl, LV_SYMBOL_PLAY "  Start Level");
+  lv_obj_set_style_text_font(bl, &lv_font_montserrat_20, 0);
+  lv_obj_center(bl);
+
+  buildPageDots(scrLeveling, 2);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Screen switch with slide animation
+// ════════════════════════════════════════════════════════════════════════
+void showScreen(Screen s) {
+  lv_obj_t *target = nullptr;
+  switch (s) {
+    case SCR_STANDBY:  target = scrStandby;  break;
+    case SCR_BUTTONS:  target = scrButtons;  break;
+    case SCR_MONITOR:  target = scrMonitor;  break;
+    case SCR_LEVELING: target = scrLeveling; break;
+  }
+  lv_scr_load_anim(target, LV_SCR_LOAD_ANIM_FADE_IN, 250, 0, false);
+  curScreen = s;
+  lastTouchMs = millis();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Live UI updates
+// ════════════════════════════════════════════════════════════════════════
+static void updateClock() {
+  struct tm t;
+  if (getLocalTime(&t, 5)) {
+    char buf[8];
+    strftime(buf, sizeof(buf), "%H:%M", &t);
+    lv_label_set_text(lblClock, buf);
+  }
+}
+
+static void updateUI(const CampData &d) {
+  // Buttons
+  for (int i = 0; i < 6; i++) {
+    bool on = (d.relayState >> i) & 1;
+    lv_obj_set_style_bg_color(relayBtns[i],
+      lv_color_hex(on ? COL_ACCENT_DK : COL_GLASS), 0);
+    lv_obj_set_style_bg_grad_color(relayBtns[i],
+      lv_color_hex(on ? COL_ACCENT : COL_GLASS_HI), 0);
+    lv_obj_set_style_border_color(relayBtns[i],
+      lv_color_hex(on ? COL_ACCENT : COL_BORDER), 0);
+    lv_label_set_text(relayBtnStates[i], on ? "ON" : "OFF");
+    lv_obj_set_style_text_color(relayBtnStates[i],
+      lv_color_hex(on ? COL_TXT : COL_TXT_DIM), 0);
+  }
+
+  // Monitor cards
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2f", d.voltage);      lv_label_set_text(monCardVals[0], d.voltage>0.1f?buf:"--");
+  snprintf(buf, sizeof(buf), "%.1f", d.current);      lv_label_set_text(monCardVals[1], d.current!=0?buf:"--");
+  snprintf(buf, sizeof(buf), "%.1f", d.solarCurrent); lv_label_set_text(monCardVals[2], d.solarCurrent!=0?buf:"--");
+  snprintf(buf, sizeof(buf), "%.0f", d.temperature);  lv_label_set_text(monCardVals[3], d.temperature!=0?buf:"--");
+
+  // Leveling readouts
+  lv_label_set_text_fmt(lblPitch, "Pitch  %+.1f°", d.pitch);
+  lv_label_set_text_fmt(lblRoll,  "Roll   %+.1f°", d.roll);
+
+  const float MAX_DEG = 12.0f;
+  int circW = lv_obj_get_width(lv_obj_get_parent(levelBubble));
+  float maxR = circW/2.0f - lv_obj_get_width(levelBubble)/2.0f - 6;
+  float pN = d.pitch/MAX_DEG, rN = d.roll/MAX_DEG;
+  float mag = sqrtf(pN*pN + rN*rN);
+  if (mag > 1) { pN/=mag; rN/=mag; }
+  lv_obj_align(levelBubble, LV_ALIGN_CENTER, (int)(rN*maxR), (int)(pN*maxR));
+  float tilt = sqrtf(d.pitch*d.pitch + d.roll*d.roll);
+  uint32_t col = tilt<1.0f?COL_ON:(tilt<5.0f?COL_WARN:COL_DANGER);
+  lv_obj_set_style_bg_color(levelBubble, lv_color_hex(col), 0);
+  lv_obj_set_style_shadow_color(levelBubble, lv_color_hex(col), 0);
+}
+
+static void refreshChart() {
+  History *h = (monitorMetric==0)?&histVoltage:(monitorMetric==1)?&histCurrent:
+               (monitorMetric==2)?&histSolar:&histTemp;
+  if (h->count < 2) return;
+  // downsample history into the 120-point chart, autoscale Y
+  int pts = lv_chart_get_point_count(monChart);
+  float mn = 1e9, mx = -1e9;
+  for (int i = 0; i < h->count; i++) {
+    float val = h->v[(h->head - h->count + i + HIST_LEN) % HIST_LEN];
+    if (val < mn) mn = val; if (val > mx) mx = val;
+  }
+  if (mx - mn < 0.5f) { mx += 0.5f; mn -= 0.5f; }
+  lv_chart_set_range(monChart, LV_CHART_AXIS_PRIMARY_Y, (int)(mn*10), (int)(mx*10));
+  for (int i = 0; i < pts; i++) {
+    int srcIdx = h->count * i / pts;
+    float val = h->v[(h->head - h->count + srcIdx + HIST_LEN) % HIST_LEN];
+    lv_chart_set_value_by_id(monChart, monSeries, i, (int)(val*10));
+  }
+  lv_chart_refresh(monChart);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Setup
+// ════════════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Camp Control display booting...");
+
+  lvgl_buf = (uint8_t*)heap_caps_malloc(LVGL_BUF_BYTES, MALLOC_CAP_SPIRAM);
+  if (!lvgl_buf) { Serial.println("PSRAM alloc failed — set PSRAM to OPI"); while(1) delay(1000); }
+
+  panel = new ESP_Panel();
+  panel->init();
+  panel->begin();
+  if (panel->getTouch()) {
+      Serial.println("Touch: FOUND");
+    } else {
+      Serial.println("Touch: NOT FOUND - check board config");
+    }
+  lv_init();
+  lv_tick_set_cb(millis);
+  lv_display_t *disp = lv_display_create(800, 480);
+  lv_display_set_flush_cb(disp, lvglFlushCb);
+  lv_display_set_buffers(disp, lvgl_buf, nullptr, LVGL_BUF_BYTES, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  lv_display_set_user_data(disp, panel);
+
+  if (panel->getTouch()) {
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, lvglTouchCb);
+    lv_indev_set_user_data(indev, panel);
+  }
+
+  lvgl_mux = xSemaphoreCreateRecursiveMutex();
+
+  LVGL_LOCK();
+  buildStandby();
+  buildButtons();
+  buildMonitor();
+  buildLeveling();
+  lv_scr_load(scrStandby);
+  LVGL_UNLOCK();
+
+  // ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onEspNowReceive);
+    Serial.println("ESP-NOW ready");
+  }
+
+  // Time: set from RTC if available; otherwise shows --:-- until synced.
+  // (Later: sync from phone or an RTC module. configTime needs internet.)
+  lastTouchMs = millis();
+  Serial.println("UI ready");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Loop
+// ════════════════════════════════════════════════════════════════════════
+void loop() {
+  LVGL_LOCK();
+
+  if (dataUpdated) {
+    dataUpdated = false;
+    CampData local;
+    memcpy(&local, (const void*)&campData, sizeof(CampData));
+    updateUI(local);
+  }
+
+  // Sample history every 2s
+  if (millis() - lastHistMs > 2000) {
+    lastHistMs = millis();
+    histPush(histVoltage, campData.voltage);
+    histPush(histCurrent, campData.current);
+    histPush(histSolar,   campData.solarCurrent);
+    histPush(histTemp,    campData.temperature);
+    if (curScreen == SCR_MONITOR) refreshChart();
+  }
+
+  // Clock + standby battery tick every 1s
+  static uint32_t lastSec = 0;
+  if (millis() - lastSec > 1000) {
+    lastSec = millis();
+    updateClock();
+    if (curScreen == SCR_STANDBY) {
+      lv_arc_set_value(battArc, mockBattPct);
+      lv_label_set_text_fmt(lblBattPct, "%d%%", mockBattPct);
+    }
+  }
+
+  // Idle → standby
+  if (curScreen != SCR_STANDBY && (millis() - lastTouchMs) > IDLE_TIMEOUT_MS) {
+    showScreen(SCR_STANDBY);
+  }
+  if (dbgX >= 0) {
+    Serial.printf("TOUCH x=%d y=%d\n", dbgX, dbgY);
+    dbgX = -1;
+  }
+
+  lv_timer_handler();
+  LVGL_UNLOCK();
+  delay(5);
+}
